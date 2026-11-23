@@ -188,7 +188,8 @@ contract GuardModule {
             initialPolicy.noveltyFractionThresholdWad == 0 ||
             initialPolicy.noveltyFractionThresholdWad > WAD ||
             initialPolicy.cadenceWarmupTransactions == 0 || initialPolicy.throttleThreatScore == 0 ||
-            initialPolicy.freezeThreatScore <= initialPolicy.throttleThreatScore || cooldownSeconds == 0 ||
+            initialPolicy.freezeThreatScore <= initialPolicy.throttleThreatScore ||
+            initialPolicy.freezeThreatScore > MAX_THREAT_SCORE || cooldownSeconds == 0 ||
             ownerAddresses.length > 10
         ) revert InvalidConfiguration();
 
@@ -515,7 +516,8 @@ contract GuardModule {
             newPolicy.noveltyFractionThresholdWad == 0 ||
             newPolicy.noveltyFractionThresholdWad > WAD ||
             newPolicy.cadenceWarmupTransactions == 0 || newPolicy.throttleThreatScore == 0 ||
-            newPolicy.freezeThreatScore <= newPolicy.throttleThreatScore
+            newPolicy.freezeThreatScore <= newPolicy.throttleThreatScore ||
+            newPolicy.freezeThreatScore > MAX_THREAT_SCORE
         ) revert InvalidConfiguration();
         bytes32 policyHash = keccak256(abi.encode(newPolicy));
         bytes32 digest = keccak256(
@@ -685,22 +687,23 @@ contract GuardModule {
     }
 
     function _verifyQuorum(bytes32 digest, bytes[] calldata signatures) private view {
-        if (signatures.length < requiredOwnerSignatures || signatures.length > owners.length) revert InvalidQuorum();
-        address[] memory recovered = new address[](signatures.length);
+        uint256 sigLen = signatures.length;
+        if (sigLen < requiredOwnerSignatures || sigLen > owners.length) revert InvalidQuorum();
+
         uint256 validSignatures;
-        for (uint256 i; i < signatures.length; ++i) {
+        // Track used owner indices with a bitmask (owners.length <= 10 per constructor).
+        uint256 usedMask;
+
+        for (uint256 i; i < sigLen; ++i) {
+            bytes calldata sig = signatures[i];
             for (uint256 j; j < owners.length; ++j) {
+                if ((usedMask & (1 << j)) != 0) continue;
                 address candidate = owners[j];
-                if (!signatureVerifier.verify(digest, candidate, signatures[i])) continue;
-                bool duplicate;
-                for (uint256 k; k < i; ++k) {
-                    if (recovered[k] == candidate) duplicate = true;
-                }
-                if (!duplicate) {
-                    recovered[i] = candidate;
+                if (signatureVerifier.verify(digest, candidate, sig)) {
+                    usedMask |= (1 << j);
                     ++validSignatures;
+                    break;
                 }
-                break;
             }
         }
         if (validSignatures < requiredOwnerSignatures) revert InvalidSignature();

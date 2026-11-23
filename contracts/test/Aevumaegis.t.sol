@@ -238,7 +238,7 @@ contract AevumaegisTest {
             )
         );
         guard.setRecipientAuthorization(supplier, true, _signQuorum(restoreDigest));
-        require(!guard.authorizedPurposeHash(supplier, PURPOSE_HASH), "old purpose approval was restored");
+        require(!guard.authorizedPurposeHash(supplier, PAYMENT_PURPOSE), "old purpose approval was restored");
 
         GuardModule.PaymentIntent memory intent = _newIntent(supplier, 1_000_000, 87);
         bytes memory signature = _signIntent(intent);
@@ -256,12 +256,12 @@ contract AevumaegisTest {
                 "AEVUMAEGIS_PURPOSE",
                 guard.governanceNonce(),
                 supplier,
-                PURPOSE_HASH,
+                PAYMENT_PURPOSE,
                 maxAmount,
                 true
             )
         );
-        guard.setPurposeAuthorization(supplier, PURPOSE_HASH, maxAmount, true, _signQuorum(digest));
+        guard.setPurposeAuthorization(supplier, PAYMENT_PURPOSE, maxAmount, true, _signQuorum(digest));
 
         GuardModule.PaymentIntent memory intent = _newIntent(supplier, maxAmount + 1, 88);
         bytes memory signature = _signIntent(intent);
@@ -679,14 +679,14 @@ contract AevumaegisTest {
                 "AEVUMAEGIS_PURPOSE",
                 guard.governanceNonce(),
                 recipient,
-                PURPOSE_HASH,
+                PAYMENT_PURPOSE,
                 authorized ? uint256(1_000_000_000_000_000_000) : uint256(0),
                 authorized
             )
         );
         guard.setPurposeAuthorization(
             recipient,
-            PURPOSE_HASH,
+            PAYMENT_PURPOSE,
             authorized ? uint256(1_000_000_000_000_000_000) : uint256(0),
             authorized,
             _signQuorum(purposeDigest)

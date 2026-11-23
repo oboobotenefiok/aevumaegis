@@ -1,21 +1,21 @@
 use std::{str::FromStr, time::Duration};
 
 use {
-    IAgentVault::IAgentVaultInstance,
-    IERC20::IERC20Instance,
-    IGuardModule::IGuardModuleInstance,
     alloy::{
         eips::BlockNumberOrTag,
         network::{EthereumWallet, ReceiptResponse},
-        primitives::{Address, B256, U256, keccak256},
+        primitives::{keccak256, Address, B256, U256},
         providers::{Provider, ProviderBuilder},
-        signers::{Signer, local::PrivateKeySigner},
+        signers::{local::PrivateKeySigner, Signer},
         sol,
         sol_types::SolValue,
     },
     clap::{Parser, ValueEnum},
     thiserror::Error,
     url::Url,
+    IAgentVault::IAgentVaultInstance,
+    IGuardModule::IGuardModuleInstance,
+    IERC20::IERC20Instance,
 };
 
 const AEVUM_CHAIN_ID: u64 = 44_005;
@@ -263,9 +263,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
             println!("Waiting for the velocity window to expire");
             tokio::time::sleep(Duration::from_secs(11)).await;
-            println!(
-                "ACT 2: six attempts planned; submit up to four and stop at the first throttle"
-            );
+            println!("ACT 2: six attempts planned; submit up to four and stop at the first throttle");
             let supplier_balance_before = payments.token_balance(arguments.supplier).await?;
             payments
                 .run_payments(
@@ -303,9 +301,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Err(SimulatorError::MissingForensicCommitment);
             }
             println!("Verified FROZEN state and forensic commitment {forensic_hash}");
-            println!(
-                "ACT 4: run scripts/rearm.sh with the owner and sentinel keys after confirming the freeze."
-            );
+            println!("ACT 4: run scripts/rearm.sh with the owner and sentinel keys after confirming the freeze.");
         }
     }
 
@@ -338,8 +334,7 @@ where
     ) -> Result<(), SimulatorError> {
         for attempt in 1..=count {
             println!("Payment attempt {attempt}/{count}");
-            self.submit_payment(recipient, amount, !delay.is_zero())
-                .await?;
+            self.submit_payment(recipient, amount, !delay.is_zero()).await?;
             if !delay.is_zero() && attempt < count {
                 tokio::time::sleep(delay).await;
             }
@@ -449,16 +444,10 @@ where
             if !receipt.status() {
                 return Err(SimulatorError::TransactionReverted(transaction_hash_value));
             }
-            println!(
-                "Confirmed transaction {transaction_hash} for intent nonce {}.",
-                self.next_nonce
-            );
+            println!("Confirmed transaction {transaction_hash} for intent nonce {}.", self.next_nonce);
         } else {
             self.pending_transactions.push(transaction_hash_value);
-            println!(
-                "Submitted transaction {transaction_hash} for intent nonce {}.",
-                self.next_nonce
-            );
+            println!("Submitted transaction {transaction_hash} for intent nonce {}.", self.next_nonce);
         }
         self.next_nonce = self.next_nonce.saturating_add(1);
         Ok(())
