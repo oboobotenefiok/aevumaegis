@@ -212,8 +212,13 @@ enum ExportError {
     WrongChain { expected: u64, actual: u64 },
     #[error("requested block range is invalid: from {from_block}, to {to_block}")]
     InvalidBlockRange { from_block: u64, to_block: u64 },
-    #[error("vault address mismatch: GuardModule is bound to {configured}, caller supplied {supplied}")]
-    VaultMismatch { configured: Address, supplied: Address },
+    #[error(
+        "vault address mismatch: GuardModule is bound to {configured}, caller supplied {supplied}"
+    )]
+    VaultMismatch {
+        configured: Address,
+        supplied: Address,
+    },
     #[error("forensic export must end at the latest block to compare the current commitment")]
     HistoricalExportUnsupported,
     #[error("chain head changed during export: expected block {expected}, now at {actual}; retry")]
@@ -250,7 +255,9 @@ enum ExportError {
         action_log_index: u64,
         decision_log_index: u64,
     },
-    #[error("payment intent at log index {intent_log_index} does not precede action at log index {action_log_index}")]
+    #[error(
+        "payment intent at log index {intent_log_index} does not precede action at log index {action_log_index}"
+    )]
     IntentOrderMismatch {
         intent_log_index: u64,
         action_log_index: u64,
@@ -319,19 +326,18 @@ struct TransactionEvents {
 fn main() -> ExitCode {
     let arguments = Arguments::parse();
     match arguments.command {
-        Command::Verify(arguments) => match verify_log(
-            arguments.log.as_path(),
-            &arguments.expected_hash,
-        ) {
-            Ok(report) => {
-                print_report(&report);
-                ExitCode::SUCCESS
+        Command::Verify(arguments) => {
+            match verify_log(arguments.log.as_path(), &arguments.expected_hash) {
+                Ok(report) => {
+                    print_report(&report);
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("FAIL: {error}");
+                    ExitCode::FAILURE
+                }
             }
-            Err(error) => {
-                eprintln!("FAIL: {error}");
-                ExitCode::FAILURE
-            }
-        },
+        }
         Command::Export(arguments) => match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -359,10 +365,7 @@ fn print_report(report: &VerificationReport) {
     println!("Final hash: {}", report.final_hash);
 }
 
-fn verify_log(
-    path: &Path,
-    expected_hash: &str,
-) -> Result<VerificationReport, VerificationError> {
+fn verify_log(path: &Path, expected_hash: &str) -> Result<VerificationReport, VerificationError> {
     let expected = parse_hash(expected_hash, 0, "expected_hash")?;
     let file = File::open(path)?;
     let reader = BufReader::new(file);
@@ -374,12 +377,11 @@ fn verify_log(
         if line.trim().is_empty() {
             continue;
         }
-        let record = serde_json::from_str(&line).map_err(|source| {
-            VerificationError::InvalidJson {
+        let record =
+            serde_json::from_str(&line).map_err(|source| VerificationError::InvalidJson {
                 line: line_number,
                 source,
-            }
-        })?;
+            })?;
         records.push((line_number, record));
     }
 
@@ -418,13 +420,12 @@ fn verify_records(
 
         let session_key = parse_address(&record.session_key, "session_key", *line_number)?;
         let recipient = parse_address(&record.recipient, "recipient", *line_number)?;
-        let amount = U256::from_str(&record.amount).map_err(|_| {
-            VerificationError::InvalidField {
+        let amount =
+            U256::from_str(&record.amount).map_err(|_| VerificationError::InvalidField {
                 line: *line_number,
                 field: "amount",
                 value: record.amount.clone(),
-            }
-        })?;
+            })?;
         let vault_address = parse_address(&record.vault_address, "vault_address", *line_number)?;
         let purpose_hash = parse_hash(&record.purpose_hash, *line_number, "purpose_hash")?;
         let recorded_intent_hash = parse_hash(&record.intent_hash, *line_number, "intent_hash")?;
@@ -461,20 +462,17 @@ fn verify_records(
         let intent_type_hash = alloy::primitives::keccak256(
             b"PaymentIntent(address vault,uint256 chainId,address sessionKey,address recipient,uint256 amount,bytes32 purposeHash,uint256 nonce,uint256 expiry)",
         );
-        let nonce = U256::from_str(&record.nonce).map_err(|_| {
-            VerificationError::InvalidField {
-                line: *line_number,
-                field: "nonce",
-                value: record.nonce.clone(),
-            }
+        let nonce = U256::from_str(&record.nonce).map_err(|_| VerificationError::InvalidField {
+            line: *line_number,
+            field: "nonce",
+            value: record.nonce.clone(),
         })?;
-        let expiry = U256::from_str(&record.expiry).map_err(|_| {
-            VerificationError::InvalidField {
+        let expiry =
+            U256::from_str(&record.expiry).map_err(|_| VerificationError::InvalidField {
                 line: *line_number,
                 field: "expiry",
                 value: record.expiry.clone(),
-            }
-        })?;
+            })?;
         if expiry < U256::from(record.timestamp) {
             return Err(VerificationError::InvalidIntentFields { line: *line_number });
         }
@@ -569,11 +567,7 @@ fn parse_address(
     })
 }
 
-fn parse_hash(
-    value: &str,
-    line: usize,
-    field: &'static str,
-) -> Result<B256, VerificationError> {
+fn parse_hash(value: &str, line: usize, field: &'static str) -> Result<B256, VerificationError> {
     B256::from_str(value).map_err(|_| VerificationError::InvalidField {
         line,
         field,
@@ -581,39 +575,36 @@ fn parse_hash(
     })
 }
 
-async fn export_and_verify(
-    arguments: ExportArguments,
-) -> Result<VerificationReport, ExportError> {
-    let guard_address = Address::from_str(&arguments.guard_address).map_err(|_| {
-        ExportError::InvalidField {
+async fn export_and_verify(arguments: ExportArguments) -> Result<VerificationReport, ExportError> {
+    let guard_address =
+        Address::from_str(&arguments.guard_address).map_err(|_| ExportError::InvalidField {
             field: "guard_address",
             value: arguments.guard_address.clone(),
-        }
-    })?;
-    let session_key = Address::from_str(&arguments.session_key).map_err(|_| {
-        ExportError::InvalidField {
+        })?;
+    let session_key =
+        Address::from_str(&arguments.session_key).map_err(|_| ExportError::InvalidField {
             field: "session_key",
             value: arguments.session_key.clone(),
-        }
-    })?;
-    let vault_address = Address::from_str(&arguments.vault_address).map_err(|_| {
-        ExportError::InvalidField {
+        })?;
+    let vault_address =
+        Address::from_str(&arguments.vault_address).map_err(|_| ExportError::InvalidField {
             field: "vault_address",
             value: arguments.vault_address.clone(),
-        }
-    })?;
-    if guard_address == Address::ZERO || session_key == Address::ZERO || vault_address == Address::ZERO {
+        })?;
+    if guard_address == Address::ZERO
+        || session_key == Address::ZERO
+        || vault_address == Address::ZERO
+    {
         return Err(ExportError::InvalidField {
             field: "address",
             value: "zero address is not valid for export".to_owned(),
         });
     }
-    let expected_hash = B256::from_str(&arguments.expected_hash).map_err(|_| {
-        ExportError::InvalidField {
+    let expected_hash =
+        B256::from_str(&arguments.expected_hash).map_err(|_| ExportError::InvalidField {
             field: "expected_hash",
             value: arguments.expected_hash.clone(),
-        }
-    })?;
+        })?;
     let rpc_url = Url::parse(&arguments.rpc_url).map_err(|_| ExportError::InvalidField {
         field: "rpc_url",
         value: arguments.rpc_url.clone(),
@@ -693,9 +684,9 @@ async fn export_and_verify(
                 field: "transaction_hash",
             });
         };
-        let log_index = log.log_index.ok_or(ExportError::MissingLogMetadata {
-            field: "log_index",
-        })?;
+        let log_index = log
+            .log_index
+            .ok_or(ExportError::MissingLogMetadata { field: "log_index" })?;
         let transaction = by_transaction.entry(transaction_hash).or_default();
 
         if log.topic0() == Some(&ActionRecorded::SIGNATURE_HASH) {
@@ -1033,7 +1024,10 @@ mod tests {
         second.action_hash = second_hash.to_string();
         let expected = second_hash;
         let result = verify_records(&[(1, first), (2, second)], expected);
-        assert!(matches!(result, Err(VerificationError::DuplicateNonce { .. })));
+        assert!(matches!(
+            result,
+            Err(VerificationError::DuplicateNonce { .. })
+        ));
         Ok(())
     }
 
@@ -1063,7 +1057,10 @@ mod tests {
         second.index = 2;
         second.session_key = Address::from([9_u8; 20]).to_string();
         let result = verify_records(&[(1, first), (2, second)], B256::ZERO);
-        assert!(matches!(result, Err(VerificationError::MixedSessionKeys { .. })));
+        assert!(matches!(
+            result,
+            Err(VerificationError::MixedSessionKeys { .. })
+        ));
         Ok(())
     }
 
@@ -1083,7 +1080,10 @@ mod tests {
         let mut record = sample_record()?;
         record.expiry = "0".to_owned();
         let result = verify_records(&[(1, record)], B256::ZERO);
-        assert!(matches!(result, Err(VerificationError::InvalidIntentFields { .. })));
+        assert!(matches!(
+            result,
+            Err(VerificationError::InvalidIntentFields { .. })
+        ));
         Ok(())
     }
 
@@ -1092,7 +1092,10 @@ mod tests {
         let mut record = sample_record()?;
         record.amount = "0".to_owned();
         let result = verify_records(&[(1, record)], B256::ZERO);
-        assert!(matches!(result, Err(VerificationError::InvalidIntentFields { .. })));
+        assert!(matches!(
+            result,
+            Err(VerificationError::InvalidIntentFields { .. })
+        ));
         Ok(())
     }
 
@@ -1103,7 +1106,10 @@ mod tests {
         second.index = 2;
         second.timestamp = 0;
         let result = verify_records(&[(1, first), (2, second)], B256::ZERO);
-        assert!(matches!(result, Err(VerificationError::TimestampRegression { .. })));
+        assert!(matches!(
+            result,
+            Err(VerificationError::TimestampRegression { .. })
+        ));
         Ok(())
     }
 
