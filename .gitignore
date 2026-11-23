@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+out/
+cache/
+broadcast/
+target/
+node_modules/
+*.log
+Cargo.lock
