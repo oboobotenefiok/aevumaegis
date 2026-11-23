@@ -11,3 +11,11 @@ via_ir = true
 [fmt]
 line_length = 100
 bracket_spacing = true
+
+[fuzz]
+runs = 10000
+
+[invariant]
+runs = 1000
+depth = 100
+fail_on_revert = true

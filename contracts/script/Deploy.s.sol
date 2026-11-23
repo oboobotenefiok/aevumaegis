@@ -39,10 +39,11 @@ contract DeployAevumaegis {
         owners[2] = ownerThree;
 
         GuardModule.Policy memory initialPolicy = GuardModule.Policy({
-            maxTransactionsPerWindow: 5,
+            maxTransactionsPerWindow: 3,
             windowSeconds: 10,
             throttleSeconds: 60,
             noveltyAmountThreshold: 10_000_000,
+            noveltyFractionThresholdWad: 5e17,
             zScoreThresholdWad: 4e18,
             drawdownLimit: 100_000_000,
             cadenceWarmupTransactions: 8,

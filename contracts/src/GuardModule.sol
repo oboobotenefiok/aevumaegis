@@ -11,8 +11,9 @@ interface IAgentVaultControl {
 
 /// @title GuardModule
 /// @notice On-chain behavioral circuit breaker and tamper-evident action recorder.
-/// @dev A blocked payment returns false rather than reverting. Reverts would erase
-///      the state transition and forensic events that explain why the payment stopped.
+/// @dev An authenticated payment blocked by behavioral policy returns false rather
+///      than reverting, preserving the state transition and forensic events. Invalid
+///      intents revert before they enter the behavioral action history.
 contract GuardModule {
     enum GuardState {
         ACTIVE,
@@ -39,12 +40,15 @@ contract GuardModule {
     uint256 private constant MAX_TRACKED_AMOUNT = 1e18;
     uint256 private constant BUCKET_COUNT = 6;
     uint256 private constant BUCKET_DURATION = 4 hours;
+    uint8 private constant VELOCITY_HISTORY_CAPACITY = 64;
+    uint8 private constant MAX_THREAT_SCORE = 11;
 
     struct Policy {
         uint32 maxTransactionsPerWindow;
         uint32 windowSeconds;
         uint32 throttleSeconds;
         uint64 noveltyAmountThreshold;
+        uint64 noveltyFractionThresholdWad;
         uint64 zScoreThresholdWad;
         uint64 drawdownLimit;
         uint32 cadenceWarmupTransactions;
@@ -52,11 +56,21 @@ contract GuardModule {
         uint8 freezeThreatScore;
     }
 
+    struct PaymentIntent {
+        address recipient;
+        uint256 amount;
+        bytes32 purposeHash;
+        uint256 nonce;
+        uint256 expiry;
+    }
+
+    bytes32 public constant PAYMENT_INTENT_TYPEHASH = keccak256(
+        "PaymentIntent(address vault,uint256 chainId,address sessionKey,address recipient,uint256 amount,bytes32 purposeHash,uint256 nonce,uint256 expiry)"
+    );
+
     struct SessionStats {
         GuardState state;
         uint64 throttleUntil;
-        uint64 windowStartedAt;
-        uint32 windowTransactions;
         uint256 actionCount;
         uint64 cumulativeSpend;
         uint64 baselineMean;
@@ -70,13 +84,13 @@ contract GuardModule {
     }
 
     address public immutable vault;
-    address public sentinel;
+    address public immutable sentinel;
     ISignatureVerifier public signatureVerifier;
     Policy public policy;
     uint256 public immutable unfreezeCooldown;
     uint256 public governanceNonce;
     uint256 public unfreezeRequestedAt;
-    uint256 public requiredOwnerSignatures;
+    uint256 public immutable requiredOwnerSignatures;
     address public pendingSessionKey;
     bool public unfreezePending;
 
@@ -84,10 +98,41 @@ contract GuardModule {
     mapping(address => bool) public isOwner;
     mapping(address => bool) public usedSessionKeys;
     mapping(address => mapping(address => bool)) public seenRecipient;
+    mapping(address => mapping(address => bool)) public recipientObserved;
+    mapping(address => uint32) public distinctRecipientCount;
+    mapping(address => bool) public authorizedRecipient;
+    mapping(address => uint256) public recipientAuthorizationEpoch;
+    mapping(address => mapping(bytes32 => uint256)) private purposeAuthorizationEpoch;
+    mapping(address => mapping(bytes32 => uint256)) private purposeAuthorizationMaxAmount;
+    mapping(address => mapping(uint256 => bool)) public usedIntentNonce;
     mapping(address => mapping(uint8 => uint32)) public cadenceBucketCounts;
+    mapping(address => mapping(uint8 => uint64)) public cadenceBucketEpochs;
+    mapping(address => mapping(uint8 => uint64)) private velocityTimestamps;
+    mapping(address => uint8) private velocityHead;
+    mapping(address => uint8) private velocityTail;
+    mapping(address => uint8) private velocityCount;
+    mapping(address => mapping(uint8 => bool)) private velocityNoveltyFlags;
+    mapping(address => uint8) private velocityNoveltyCount;
     mapping(address => SessionStats) private sessionStats;
 
-    event ActionRecorded(uint256 indexed index, bytes32 indexed actionHash, ActionKind kind);
+    event ActionRecorded(uint256 indexed index, bytes32 indexed actionHash, ActionKind kind, bytes32 intentHash);
+    event RecipientAuthorizationUpdated(address indexed recipient, bool authorized, uint256 governanceNonce);
+    event PurposeAuthorizationUpdated(
+        address indexed recipient,
+        bytes32 indexed purposeHash,
+        uint256 maxAmount,
+        bool authorized,
+        uint256 governanceNonce
+    );
+    event PaymentIntentAuthenticated(
+        address indexed sessionKey,
+        address indexed recipient,
+        uint256 amount,
+        bytes32 purposeHash,
+        uint256 nonce,
+        uint256 expiry,
+        bytes32 intentHash
+    );
     event ForensicCommitment(bytes32 indexed finalHash, uint256 actionCount, bytes32 reasonCode);
     event SessionKeyThrottled(address indexed sessionKey, bytes32 reasonCode, uint256 untilTimestamp);
     event SessionKeyFrozen(address indexed sessionKey, bytes32 reasonCode, bytes32 finalHash);
@@ -109,6 +154,12 @@ contract GuardModule {
     error SessionNotFrozen();
     error UnfreezeAlreadyPending();
     error VetoWindowExpired();
+    error InvalidPaymentIntent();
+    error PaymentIntentExpired();
+    error UnauthorizedRecipient();
+    error UnauthorizedPurpose();
+    error PurposeAmountExceeded();
+    error IntentNonceAlreadyUsed();
 
     modifier onlyVault() {
         if (msg.sender != vault) revert OnlyVault();
@@ -125,12 +176,17 @@ contract GuardModule {
         Policy memory initialPolicy
     ) {
         if (
-            vaultAddress == address(0) || sentinelAddress == address(0) ||
-            verifierAddress == address(0) || ownerAddresses.length == 0 ||
+            vaultAddress == address(0) || vaultAddress.code.length == 0 ||
+            sentinelAddress == address(0) || sentinelAddress.code.length != 0 ||
+            verifierAddress == address(0) || verifierAddress.code.length == 0 || ownerAddresses.length == 0 ||
             requiredSignatures == 0 || requiredSignatures > ownerAddresses.length ||
-            initialPolicy.maxTransactionsPerWindow == 0 || initialPolicy.windowSeconds == 0 ||
+            initialPolicy.maxTransactionsPerWindow == 0 ||
+            initialPolicy.maxTransactionsPerWindow >= VELOCITY_HISTORY_CAPACITY ||
+            initialPolicy.windowSeconds == 0 ||
             initialPolicy.throttleSeconds == 0 || initialPolicy.zScoreThresholdWad == 0 ||
             initialPolicy.drawdownLimit == 0 || initialPolicy.noveltyAmountThreshold == 0 ||
+            initialPolicy.noveltyFractionThresholdWad == 0 ||
+            initialPolicy.noveltyFractionThresholdWad > WAD ||
             initialPolicy.cadenceWarmupTransactions == 0 || initialPolicy.throttleThreatScore == 0 ||
             initialPolicy.freezeThreatScore <= initialPolicy.throttleThreatScore || cooldownSeconds == 0 ||
             ownerAddresses.length > 10
@@ -138,7 +194,10 @@ contract GuardModule {
 
         vault = vaultAddress;
         address initialSessionKey = IAgentVaultControl(vaultAddress).sessionKey();
-        if (initialSessionKey == address(0) || initialSessionKey == sentinelAddress) {
+        if (
+            initialSessionKey == address(0) || initialSessionKey == sentinelAddress ||
+            initialSessionKey.code.length != 0
+        ) {
             revert InvalidConfiguration();
         }
         usedSessionKeys[initialSessionKey] = true;
@@ -151,8 +210,8 @@ contract GuardModule {
         for (uint256 i; i < ownerAddresses.length; ++i) {
             address ownerAddress = ownerAddresses[i];
             if (
-                ownerAddress == address(0) || ownerAddress == sentinelAddress ||
-                ownerAddress == initialSessionKey || isOwner[ownerAddress]
+                ownerAddress == address(0) || ownerAddress.code.length != 0 ||
+                ownerAddress == sentinelAddress || ownerAddress == initialSessionKey || isOwner[ownerAddress]
             ) revert InvalidConfiguration();
             isOwner[ownerAddress] = true;
             owners.push(ownerAddress);
@@ -172,6 +231,18 @@ contract GuardModule {
         return sessionStats[sessionKey];
     }
 
+    function getSessionState(address sessionKey) external view returns (GuardState) {
+        return sessionStats[sessionKey].state;
+    }
+
+    function getActionCount(address sessionKey) external view returns (uint256) {
+        return sessionStats[sessionKey].actionCount;
+    }
+
+    function getFinalForensicHash(address sessionKey) external view returns (bytes32) {
+        return sessionStats[sessionKey].finalForensicHash;
+    }
+
     function getPolicy() external view returns (Policy memory) {
         return policy;
     }
@@ -180,21 +251,58 @@ contract GuardModule {
     /// @return allowed True only when Vault may transfer the token.
     function evaluatePayment(
         address sessionKey,
-        address recipient,
-        uint256 amount
+        PaymentIntent calldata intent,
+        bytes calldata signature
     ) external onlyVault returns (bool allowed) {
+        if (
+            intent.recipient == address(0) || intent.amount == 0 ||
+            intent.amount > MAX_TRACKED_AMOUNT || intent.purposeHash == bytes32(0)
+        ) revert InvalidPaymentIntent();
+        if (intent.expiry < block.timestamp) revert PaymentIntentExpired();
+        if (!authorizedRecipient[intent.recipient]) revert UnauthorizedRecipient();
+        uint256 purposeMaxAmount = authorizedPurposeAmount(intent.recipient, intent.purposeHash);
+        if (purposeMaxAmount == 0) revert UnauthorizedPurpose();
+        if (intent.amount > purposeMaxAmount) revert PurposeAmountExceeded();
+        if (usedIntentNonce[sessionKey][intent.nonce]) revert IntentNonceAlreadyUsed();
+
+        bytes32 intentDigest = keccak256(
+            abi.encode(
+                PAYMENT_INTENT_TYPEHASH,
+                vault,
+                block.chainid,
+                sessionKey,
+                intent.recipient,
+                intent.amount,
+                intent.purposeHash,
+                intent.nonce,
+                intent.expiry
+            )
+        );
+        if (!signatureVerifier.verify(intentDigest, sessionKey, signature)) revert InvalidSignature();
+        usedIntentNonce[sessionKey][intent.nonce] = true;
+        emit PaymentIntentAuthenticated(
+            sessionKey,
+            intent.recipient,
+            intent.amount,
+            intent.purposeHash,
+            intent.nonce,
+            intent.expiry,
+            intentDigest
+        );
+
         SessionStats storage stats = sessionStats[sessionKey];
         if (stats.state == GuardState.FROZEN) {
-            _recordAction(stats, sessionKey, recipient, amount, ActionKind.BLOCKED_PAYMENT);
+            _recordAction(
+                stats,
+                sessionKey,
+                intent.recipient,
+                intent.amount,
+                ActionKind.BLOCKED_PAYMENT,
+                intentDigest
+            );
             stats.finalForensicHash = stats.rollingHash;
             emit ForensicCommitment(stats.finalForensicHash, stats.actionCount, stats.freezeReason);
-            emit PaymentDecision(sessionKey, recipient, amount, false);
-            return false;
-        }
-
-        if (recipient == address(0) || amount == 0 || amount > MAX_TRACKED_AMOUNT) {
-            _recordAction(stats, sessionKey, recipient, amount, ActionKind.BLOCKED_PAYMENT);
-            emit PaymentDecision(sessionKey, recipient, amount, false);
+            emit PaymentDecision(sessionKey, intent.recipient, intent.amount, false);
             return false;
         }
 
@@ -202,11 +310,16 @@ contract GuardModule {
             stats.state = GuardState.ACTIVE;
         }
 
-        bytes32 violation = _evaluateBehavior(sessionKey, recipient, amount, stats);
+        bytes32 violation = _evaluateBehavior(sessionKey, intent.recipient, intent.amount, stats);
         ActionKind actionKind = violation == bytes32(0)
             ? ActionKind.PAYMENT
             : ActionKind.BLOCKED_PAYMENT;
-        _recordAction(stats, sessionKey, recipient, amount, actionKind);
+        _recordAction(stats, sessionKey, intent.recipient, intent.amount, actionKind, intentDigest);
+
+        if (violation == REASON_THROTTLE_ACTIVE) {
+            emit PaymentDecision(sessionKey, intent.recipient, intent.amount, false);
+            return false;
+        }
 
         if (violation != bytes32(0)) {
             bool hardFreeze =
@@ -219,15 +332,15 @@ contract GuardModule {
                 stats.throttleUntil = uint64(block.timestamp + policy.throttleSeconds);
                 emit SessionKeyThrottled(sessionKey, violation, stats.throttleUntil);
             }
-            emit PaymentDecision(sessionKey, recipient, amount, false);
+            emit PaymentDecision(sessionKey, intent.recipient, intent.amount, false);
             return false;
         }
 
-        stats.cumulativeSpend += uint64(amount);
-        _updateBaseline(stats, amount);
+        stats.cumulativeSpend += uint64(intent.amount);
+        _updateBaseline(stats, intent.amount);
         _recordCadence(sessionKey);
-        seenRecipient[sessionKey][recipient] = true;
-        emit PaymentDecision(sessionKey, recipient, amount, true);
+        seenRecipient[sessionKey][intent.recipient] = true;
+        emit PaymentDecision(sessionKey, intent.recipient, intent.amount, true);
         return true;
     }
 
@@ -236,7 +349,8 @@ contract GuardModule {
         address sessionKey,
         address recipient,
         uint256 amount,
-        ActionKind kind
+        ActionKind kind,
+        bytes32 intentHash
     ) private {
         uint256 actionIndex = stats.actionCount + 1;
         bytes32 actionHash = keccak256(
@@ -247,20 +361,21 @@ contract GuardModule {
                 amount,
                 block.timestamp,
                 actionIndex,
-                kind
+                kind,
+                intentHash
             )
         );
         stats.rollingHash = actionHash;
         stats.actionCount = actionIndex;
-        emit ActionRecorded(actionIndex, actionHash, kind);
+        emit ActionRecorded(actionIndex, actionHash, kind, intentHash);
     }
 
     function requestUnfreeze(address newSessionKey, bytes[] calldata signatures) external {
         if (unfreezePending) revert UnfreezeAlreadyPending();
         if (!_sessionStateIsFrozen()) revert SessionNotFrozen();
         if (
-            newSessionKey == address(0) || newSessionKey == sentinel ||
-            isOwner[newSessionKey] || usedSessionKeys[newSessionKey]
+            newSessionKey == address(0) || newSessionKey.code.length != 0 ||
+            newSessionKey == sentinel || isOwner[newSessionKey] || usedSessionKeys[newSessionKey]
         ) revert InvalidConfiguration();
         bytes32 digest = keccak256(
             abi.encode(
@@ -297,8 +412,8 @@ contract GuardModule {
         address newSessionKey = pendingSessionKey;
         if (sessionStats[previousKey].state != GuardState.FROZEN) revert SessionNotFrozen();
         if (
-            newSessionKey == address(0) || newSessionKey == sentinel ||
-            isOwner[newSessionKey] || usedSessionKeys[newSessionKey]
+            newSessionKey == address(0) || newSessionKey.code.length != 0 ||
+            newSessionKey == sentinel || isOwner[newSessionKey] || usedSessionKeys[newSessionKey]
         ) revert InvalidConfiguration();
 
         usedSessionKeys[newSessionKey] = true;
@@ -310,11 +425,95 @@ contract GuardModule {
         emit UnfreezeExecuted(previousKey, newSessionKey, block.timestamp);
     }
 
+    function setRecipientAuthorization(
+        address recipient,
+        bool authorized,
+        bytes[] calldata signatures
+    ) external {
+        if (recipient == address(0) || recipient == vault) revert InvalidConfiguration();
+        bytes32 digest = keccak256(
+            abi.encode(
+                address(this),
+                block.chainid,
+                "AEVUMAEGIS_RECIPIENT",
+                governanceNonce,
+                recipient,
+                authorized
+            )
+        );
+        _verifyQuorum(digest, signatures);
+        if (authorizedRecipient[recipient] != authorized) {
+            ++recipientAuthorizationEpoch[recipient];
+        }
+        authorizedRecipient[recipient] = authorized;
+        ++governanceNonce;
+        emit RecipientAuthorizationUpdated(recipient, authorized, governanceNonce);
+    }
+
+    function setPurposeAuthorization(
+        address recipient,
+        bytes32 purposeHash,
+        uint256 maxAmount,
+        bool authorized,
+        bytes[] calldata signatures
+    ) external {
+        if (
+            recipient == address(0) || recipient == address(vault) || purposeHash == bytes32(0) ||
+            (authorized && (maxAmount == 0 || maxAmount > MAX_TRACKED_AMOUNT)) ||
+            (!authorized && maxAmount != 0)
+        ) revert InvalidConfiguration();
+
+        bytes32 digest = keccak256(
+            abi.encode(
+                address(this),
+                block.chainid,
+                "AEVUMAEGIS_PURPOSE",
+                governanceNonce,
+                recipient,
+                purposeHash,
+                maxAmount,
+                authorized
+            )
+        );
+        _verifyQuorum(digest, signatures);
+        if (authorized && !authorizedRecipient[recipient]) revert UnauthorizedRecipient();
+        purposeAuthorizationEpoch[recipient][purposeHash] =
+            authorized ? recipientAuthorizationEpoch[recipient] : 0;
+        purposeAuthorizationMaxAmount[recipient][purposeHash] = authorized ? maxAmount : 0;
+        ++governanceNonce;
+        emit PurposeAuthorizationUpdated(recipient, purposeHash, maxAmount, authorized, governanceNonce);
+    }
+
+    function authorizedPurposeHash(address recipient, bytes32 purposeHash)
+        public
+        view
+        returns (bool)
+    {
+        uint256 currentEpoch = recipientAuthorizationEpoch[recipient];
+        return
+            authorizedRecipient[recipient] && currentEpoch != 0 &&
+            purposeAuthorizationEpoch[recipient][purposeHash] == currentEpoch &&
+            purposeAuthorizationMaxAmount[recipient][purposeHash] != 0;
+    }
+
+    function authorizedPurposeAmount(address recipient, bytes32 purposeHash)
+        public
+        view
+        returns (uint256)
+    {
+        if (!authorizedPurposeHash(recipient, purposeHash)) return 0;
+        return purposeAuthorizationMaxAmount[recipient][purposeHash];
+    }
+
     function updatePolicy(Policy calldata newPolicy, bytes[] calldata signatures) external {
         if (
-            newPolicy.maxTransactionsPerWindow == 0 || newPolicy.windowSeconds == 0 ||
+            newPolicy.maxTransactionsPerWindow == 0 ||
+            newPolicy.maxTransactionsPerWindow >= VELOCITY_HISTORY_CAPACITY ||
+            newPolicy.windowSeconds == 0 ||
             newPolicy.throttleSeconds == 0 || newPolicy.zScoreThresholdWad == 0 ||
             newPolicy.drawdownLimit == 0 || newPolicy.noveltyAmountThreshold == 0 ||
+            newPolicy.noveltyFractionThresholdWad == 0 ||
+            newPolicy.noveltyFractionThresholdWad > WAD ||
             newPolicy.cadenceWarmupTransactions == 0 || newPolicy.throttleThreatScore == 0 ||
             newPolicy.freezeThreatScore <= newPolicy.throttleThreatScore
         ) revert InvalidConfiguration();
@@ -329,7 +528,7 @@ contract GuardModule {
     }
 
     function updateSignatureVerifier(address newVerifier, bytes[] calldata signatures) external {
-        if (newVerifier == address(0)) revert InvalidConfiguration();
+        if (newVerifier == address(0) || newVerifier.code.length == 0) revert InvalidConfiguration();
         bytes32 digest = keccak256(
             abi.encode(address(this), block.chainid, "AEVUMAEGIS_VERIFIER", governanceNonce, newVerifier)
         );
@@ -345,12 +544,16 @@ contract GuardModule {
         uint256 amount,
         SessionStats storage stats
     ) private returns (bytes32) {
-        if (block.timestamp - stats.windowStartedAt > policy.windowSeconds) {
-            stats.windowStartedAt = uint64(block.timestamp);
-            stats.windowTransactions = 0;
+        bool isNewRecipient = !recipientObserved[sessionKey][recipient];
+        if (isNewRecipient) {
+            recipientObserved[sessionKey][recipient] = true;
+            ++distinctRecipientCount[sessionKey];
         }
-        ++stats.windowTransactions;
-        bool velocityExceeded = stats.windowTransactions > policy.maxTransactionsPerWindow;
+        (bool velocityExceeded, uint256 noveltyFractionWad) =
+            _recordVelocity(sessionKey, isNewRecipient);
+        bool noveltyFractionExceeded =
+            stats.totalObservedTransactions >= policy.cadenceWarmupTransactions &&
+            noveltyFractionWad >= policy.noveltyFractionThresholdWad;
 
         bool anomalous;
         if (stats.hasBaseline) {
@@ -366,14 +569,15 @@ contract GuardModule {
 
         bool novelLarge = !seenRecipient[sessionKey][recipient] && amount > policy.noveltyAmountThreshold;
         bool drawdownExceeded = stats.cumulativeSpend + amount > policy.drawdownLimit;
-        uint8 bucket = uint8((block.timestamp / BUCKET_DURATION) % BUCKET_COUNT);
-        bool cadenceDeviation =
-            stats.totalObservedTransactions >= policy.cadenceWarmupTransactions &&
-            cadenceBucketCounts[sessionKey][bucket] == 0;
+        uint64 bucketEpoch = uint64(block.timestamp / BUCKET_DURATION);
+        uint8 bucket = uint8(bucketEpoch % BUCKET_COUNT);
+        bool cadenceDeviation = stats.totalObservedTransactions >= policy.cadenceWarmupTransactions &&
+            (cadenceBucketEpochs[sessionKey][bucket] != bucketEpoch ||
+                cadenceBucketCounts[sessionKey][bucket] == 0);
 
         uint8 score;
         if (velocityExceeded) score += 2;
-        if (novelLarge) score += 2;
+        if (novelLarge || noveltyFractionExceeded) score += 2;
         if (anomalous) score += 3;
         if (drawdownExceeded) score += 3;
         if (cadenceDeviation) score += 1;
@@ -386,13 +590,14 @@ contract GuardModule {
         if (anomalous) return REASON_ANOMALY;
         if (drawdownExceeded) return REASON_DRAWDOWN;
         if (stats.state == GuardState.THROTTLED) {
+            if (noveltyFractionExceeded) return REASON_NOVEL_RECIPIENT;
             if (velocityExceeded) return REASON_VELOCITY;
             if (cadenceDeviation) return REASON_CADENCE;
             return REASON_THROTTLE_ACTIVE;
         }
         if (score >= policy.freezeThreatScore) return REASON_COMPOSITE_SCORE;
         if (score >= policy.throttleThreatScore) {
-            if (novelLarge) return REASON_NOVEL_RECIPIENT;
+            if (novelLarge || noveltyFractionExceeded) return REASON_NOVEL_RECIPIENT;
             if (velocityExceeded) return REASON_VELOCITY;
             if (cadenceDeviation) return REASON_CADENCE;
         }
@@ -415,8 +620,56 @@ contract GuardModule {
         ++stats.totalObservedTransactions;
     }
 
+    function _recordVelocity(address sessionKey, bool isNewRecipient)
+        private
+        returns (bool exceeded, uint256 noveltyFractionWad)
+    {
+        uint8 head = velocityHead[sessionKey];
+        uint8 count = velocityCount[sessionKey];
+        uint8 novelCount = velocityNoveltyCount[sessionKey];
+
+        while (count > 0) {
+            uint64 oldestTimestamp = velocityTimestamps[sessionKey][head];
+            if (
+                block.timestamp < oldestTimestamp ||
+                block.timestamp - oldestTimestamp < policy.windowSeconds
+            ) break;
+
+            if (velocityNoveltyFlags[sessionKey][head]) --novelCount;
+            head = uint8((uint256(head) + 1) % VELOCITY_HISTORY_CAPACITY);
+            --count;
+        }
+
+        velocityHead[sessionKey] = head;
+        exceeded = uint256(count) + 1 > policy.maxTransactionsPerWindow;
+
+        // Keep the newest 64 actions. The configured threshold is capped at 63,
+        // so dropping the oldest entry cannot hide a threshold breach.
+        if (count == VELOCITY_HISTORY_CAPACITY) {
+            if (velocityNoveltyFlags[sessionKey][head]) --novelCount;
+            head = uint8((uint256(head) + 1) % VELOCITY_HISTORY_CAPACITY);
+            --count;
+            velocityHead[sessionKey] = head;
+        }
+
+        uint8 tail = velocityTail[sessionKey];
+        velocityTimestamps[sessionKey][tail] = uint64(block.timestamp);
+        velocityNoveltyFlags[sessionKey][tail] = isNewRecipient;
+        velocityTail[sessionKey] = uint8((uint256(tail) + 1) % VELOCITY_HISTORY_CAPACITY);
+        if (isNewRecipient) ++novelCount;
+        ++count;
+        velocityCount[sessionKey] = count;
+        velocityNoveltyCount[sessionKey] = novelCount;
+        noveltyFractionWad = uint256(novelCount) * WAD / count;
+    }
+
     function _recordCadence(address sessionKey) private {
-        uint8 bucket = uint8((block.timestamp / BUCKET_DURATION) % BUCKET_COUNT);
+        uint64 bucketEpoch = uint64(block.timestamp / BUCKET_DURATION);
+        uint8 bucket = uint8(bucketEpoch % BUCKET_COUNT);
+        if (cadenceBucketEpochs[sessionKey][bucket] != bucketEpoch) {
+            cadenceBucketEpochs[sessionKey][bucket] = bucketEpoch;
+            cadenceBucketCounts[sessionKey][bucket] = 0;
+        }
         ++cadenceBucketCounts[sessionKey][bucket];
     }
 

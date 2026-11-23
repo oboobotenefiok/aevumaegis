@@ -9,7 +9,7 @@ interface IERC20Minimal {
 }
 
 /// @title AgentVault
-/// @notice Holds stablecoins and only lets its delegated session key pay through GuardModule.
+/// @notice Holds stablecoins and requires signed, guard-validated intents for session-key payments.
 contract AgentVault {
     address public immutable owner;
     IERC20Minimal public immutable token;
@@ -30,6 +30,7 @@ contract AgentVault {
     error InvalidAddress();
     error TokenTransferFailed();
     error OnlyGuard();
+    error InvalidGuard();
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert OnlyOwner();
@@ -44,7 +45,10 @@ contract AgentVault {
     }
 
     constructor(address tokenAddress, address ownerAddress, address initialSessionKey) {
-        if (tokenAddress == address(0) || ownerAddress == address(0) || initialSessionKey == address(0)) {
+        if (
+            tokenAddress == address(0) || tokenAddress.code.length == 0 ||
+            ownerAddress == address(0) || initialSessionKey == address(0)
+        ) {
             revert InvalidAddress();
         }
         token = IERC20Minimal(tokenAddress);
@@ -55,6 +59,9 @@ contract AgentVault {
     function configureGuard(address guardAddress) external onlyOwner {
         if (guardConfigured) revert GuardAlreadyConfigured();
         if (guardAddress == address(0)) revert InvalidAddress();
+        if (guardAddress.code.length == 0 || GuardModule(guardAddress).vault() != address(this)) {
+            revert InvalidGuard();
+        }
         guard = GuardModule(guardAddress);
         guardConfigured = true;
         emit GuardConfigured(guardAddress);
@@ -73,17 +80,20 @@ contract AgentVault {
         emit Deposited(msg.sender, amount);
     }
 
-    function pay(address recipient, uint256 amount) external nonReentrant returns (bool allowed) {
+    function pay(
+        GuardModule.PaymentIntent calldata intent,
+        bytes calldata signature
+    ) external nonReentrant returns (bool allowed) {
         if (msg.sender != sessionKey) revert OnlySessionKey();
         if (!guardConfigured) revert InvalidAddress();
 
-        allowed = guard.evaluatePayment(msg.sender, recipient, amount);
+        allowed = guard.evaluatePayment(msg.sender, intent, signature);
         if (!allowed) {
-            emit PaymentBlocked(recipient, amount);
+            emit PaymentBlocked(intent.recipient, intent.amount);
             return false;
         }
-        if (!token.transfer(recipient, amount)) revert TokenTransferFailed();
-        emit PaymentExecuted(recipient, amount);
+        if (!token.transfer(intent.recipient, intent.amount)) revert TokenTransferFailed();
+        emit PaymentExecuted(intent.recipient, intent.amount);
     }
 
 
