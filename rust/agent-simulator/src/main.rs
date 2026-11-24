@@ -3,7 +3,7 @@ use std::{str::FromStr, time::Duration};
 use {
     alloy::{
         eips::BlockNumberOrTag,
-        network::{EthereumWallet, ReceiptResponse},
+        network::EthereumWallet,
         primitives::{keccak256, Address, B256, U256},
         providers::{Provider, ProviderBuilder},
         signers::{local::PrivateKeySigner, Signer},
@@ -140,6 +140,8 @@ enum SimulatorError {
         configured: Address,
         supplied: Address,
     },
+    #[error("guard is not bound to the supplied vault")]
+    GuardVaultMismatch,
 }
 
 #[tokio::main]

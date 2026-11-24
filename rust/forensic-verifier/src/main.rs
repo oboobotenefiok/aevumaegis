@@ -522,7 +522,7 @@ fn verify_records(
             amount,
             U256::from(record.timestamp),
             U256::from(record.index),
-            alloy::primitives::Uint::<8, 1>::from(record.kind),
+            U256::from(record.kind),
             recorded_intent_hash,
         )
             .abi_encode();
@@ -953,7 +953,7 @@ mod tests {
                 U256::from(1_000_000_u64),
                 U256::from(1_u64),
                 U256::from(1_u64),
-                alloy::primitives::Uint::<8, 1>::from(0_u8),
+                U256::from(0_u8),
                 intent_hash,
             )
                 .abi_encode(),
@@ -1025,7 +1025,7 @@ mod tests {
                 U256::from_str(&second.amount)?,
                 U256::from(2_u64),
                 U256::from(2_u64),
-                alloy::primitives::Uint::<8, 1>::from(second.kind),
+                U256::from(second.kind),
                 B256::from_str(&second.intent_hash)?,
             )
                 .abi_encode(),
